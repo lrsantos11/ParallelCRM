@@ -1,0 +1,4 @@
+Counts below compare configuration means using full precision (per-instance statistic: minimum (BenchmarkTools @belapsed)).
+P-CRM threads=10 vs CRM (threads=1): configurations=0; CRM faster=0; P-CRM faster=0; P-CRM projections equal=0, greater=0, fewer=0; failed pairs excluded=0.
+P-CRM threads=10 vs F-SPM threads=10: configurations=24; P-CRM faster=24; P-CRM fewer projections=24.
+Failed method/configuration groups: 0

@@ -6,6 +6,5 @@
 Manifest.toml
 /data/*
 !/data/.gitkeep
-/data/table1/*
-!/data/table1/.gitkeep
+!/data/table1/
 .vscode/*

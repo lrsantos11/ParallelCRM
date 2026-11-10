@@ -1,0 +1,42 @@
+accelerator = "AppleAccelerate"
+benchmark_engine = "BenchmarkTools (@benchmark with evals=1, gcsample=true)"
+blas_threads = 1
+block_alpha = 0.5
+block_rule = "legacy"
+block_target = 20
+coherences = [0.0, 0.1, 0.2]
+columns = [100, 250, 500, 1000]
+complete = true
+environment_sha256 = "302d4ea8327e4bd74ba833ae09c1ea114d2297db2c31b87862cee1460a8fc2c0"
+finished_utc = "2026-11-10T17:37:31.069"
+gc_policy = "BenchmarkTools gcsample=true (GC.gc() before each timed sample)"
+iteration_limit = 10000
+julia_process_threads = 10
+julia_threads = 1
+julia_version = "1.13.2"
+method_order = "cyclic rotation by instance; runs are sequential"
+mode = "large"
+preprocessing_excluded = "matrix/RHS generation, partition, QR factorizations, reference/warm-up run, explicit pre-sample GC, validation and output"
+preprocessing_included = false
+rng = "MersenneTwister (private; regenerated identically in each pass)"
+rows = [5000, 7500, 10000, 12500, 20000, 30000]
+samples = 5
+seed = 42
+source_commit = "f0a369257c542bf94115289ec22562d5530a6392"
+source_dirty_or_untracked = true
+source_sha256 = "424e3b063e8527eb3654827aa7428be0fe9826bcde1e3d830e0b9e208894c72a"
+started_utc = "2026-11-10T17:34:05.347"
+timed_solves = 1080
+timing_statistic = "configurable: minimum (@belapsed) or median across samples, then arithmetic mean over three coherences"
+tolerance = 1.0e-5
+
+[machine]
+accelerator = "AppleAccelerate"
+arch = "aarch64"
+blas_configuration = "LBTConfig([ILP64] libopenblas64_.0.3.30.dylib, [LP64] Accelerate, [ILP64] Accelerate)"
+cpu_models = ["Apple M4"]
+cpu_threads = 10
+kernel = "Darwin"
+logical_cpus_visible = 10
+machine = "arm64-apple-darwin27.0.0"
+memory_bytes = 0x0600000000
