@@ -4,7 +4,8 @@
 *.jl.mem
 .DS_Store
 Manifest.toml
-/data/sims/*
-/data/table1_smoke/*
+/data/*
+!/data/.gitkeep
+/data/table1/*
 !/data/table1/.gitkeep
 .vscode/*

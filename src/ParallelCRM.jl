@@ -119,31 +119,83 @@ function form_Affine_blocks(A::AbstractMatrix, b::AbstractVector, num_blocks::In
 end
 
 """
+    BlockQRProjection{T,MT,VT,FT}
+
+Callable struct computing the orthogonal projection onto the affine subspace `{x : A*x = b}`
+using a precomputed column-pivoted QR factorization of `A'` and block-private work buffers.
+Supports both out-of-place `P(x)` and zero-allocation in-place `P(out, x)` evaluation.
+"""
+struct BlockQRProjection{T<:AbstractFloat,MT<:AbstractMatrix{T},VT<:AbstractVector{T},FT}
+    A::MT
+    b::VT
+    F::FT
+    rhs::Vector{T}
+    correction::Vector{T}
+    coordinates::Vector{T}
+end
+
+@inline function (P::BlockQRProjection{T})(out::AbstractVector{T}, x::AbstractVector{T}) where {T<:AbstractFloat}
+    iszero(x) ? fill!(P.rhs, zero(T)) : mul!(P.rhs, P.A, x)
+    axpy!(-one(T), P.b, P.rhs)
+    @views rhspivoted = P.rhs[P.F.p]
+    ldiv!(P.coordinates, LowerTriangular(P.F.R'), rhspivoted)
+    mul!(P.correction, P.F.Q, P.coordinates)
+    @inbounds @simd for j in eachindex(out, x, P.correction)
+        out[j] = x[j] - P.correction[j]
+    end
+    return out
+end
+
+@inline function (P::BlockQRProjection{T})(x::AbstractVector{T}) where {T<:AbstractFloat}
+    return P(similar(x), x)
+end
+
+@inline function apply_projection!(out::AbstractVector{T}, project::BlockQRProjection{T}, x::AbstractVector{T}) where {T<:AbstractFloat}
+    return project(out, x)
+end
+
+@inline function apply_projection!(out::AbstractVector{T}, project, x::AbstractVector{T}) where {T<:AbstractFloat}
+    res = project(x)
+    copyto!(out, res)
+    return out
+end
+
+@inline function apply_reflection!(out::AbstractVector{T}, project::BlockQRProjection{T}, x::AbstractVector{T}) where {T<:AbstractFloat}
+    project(out, x)
+    @inbounds @simd for j in eachindex(out, x)
+        out[j] = T(2) * out[j] - x[j]
+    end
+    return out
+end
+
+@inline function apply_reflection!(out::AbstractVector{T}, project, x::AbstractVector{T}) where {T<:AbstractFloat}
+    res = project(x)
+    @inbounds @simd for j in eachindex(out, res, x)
+        out[j] = T(2) * res[j] - x[j]
+    end
+    return out
+end
+
+"""
     projection_factory(A, b)
 
-Creates a closure computing the orthogonal projection onto the affine subspace `{x : A*x = b}`
-using a precomputed column-pivoted QR factorization of `A'` and block-private work buffers.
-Because each closure owns its buffers, distinct blocks can be evaluated concurrently across threads.
+Creates a `BlockQRProjection` callable struct computing the orthogonal projection onto the
+affine subspace `{x : A*x = b}` using a precomputed column-pivoted QR factorization of `A'`
+and block-private work buffers. Because each instance owns its buffers and shares a concrete
+type, distinct blocks can be evaluated concurrently across threads without dynamic dispatch
+or heap allocations.
 """
 function projection_factory(A::AbstractMatrix{T}, b::AbstractVector{T}) where {T<:AbstractFloat}
     rows, cols = size(A)
     length(b) == rows || throw(DimensionMismatch("A and b row counts differ"))
     rows <= cols || throw(ArgumentError("projection_factory requires blocks with rows <= cols (got ($rows, $cols))"))
-    F = qr(transpose(A), ColumnNorm())
-    rhs = similar(b)
-    correction = similar(b, cols)
-    coordinates = similar(b, rows)
-
-    function project(x::AbstractVector{T})
-        iszero(x) ? fill!(rhs, zero(T)) : mul!(rhs, A, x)
-        axpy!(-one(T), b, rhs)
-        # Since A'[:, F.p] = Q * R, applying A'(A A')^{-1} reduces to Q * (R')^{-1} * rhs[F.p].
-        @views rhspivoted = rhs[F.p]
-        ldiv!(coordinates, LowerTriangular(F.R'), rhspivoted)
-        mul!(correction, F.Q, coordinates)
-        return x - correction
-    end
-    return project
+    A_mat = Matrix{T}(A)
+    b_vec = Vector{T}(b)
+    F = qr(transpose(A_mat), ColumnNorm())
+    rhs = Vector{T}(undef, rows)
+    correction = Vector{T}(undef, cols)
+    coordinates = Vector{T}(undef, rows)
+    return BlockQRProjection{T,Matrix{T},Vector{T},typeof(F)}(A_mat, b_vec, F, rhs, correction, coordinates)
 end
 
 """
@@ -157,12 +209,20 @@ function projection_block_QR(A::AbstractMatrix, b::AbstractVector, blocks::Int)
 end
 
 """
-    find_circumcenter!(CC, points)
+    find_circumcenter!(CC, points; directions=nothing, G=nothing, b=nothing, threaded::Bool=false)
 
 Computes the circumcenter of the points in `points` and stores the result in `CC`.
-`points[1]` is used as the anchor point to construct the Gram matrix.
+`points[1]` is used as the anchor point to construct the Gram matrix. Optional preallocated
+buffers `directions`, `G`, and `b` avoid heap allocations inside iterative loops.
 """
-function find_circumcenter!(CC::AbstractVector{T}, points) where {T<:AbstractFloat}
+function find_circumcenter!(
+    CC::AbstractVector{T},
+    points;
+    directions::Union{Nothing,Vector{Vector{T}}} = nothing,
+    G::Union{Nothing,Matrix{T}} = nothing,
+    b::Union{Nothing,Vector{T}} = nothing,
+    threaded::Bool = false
+) where {T<:AbstractFloat}
     m = length(points)
     m >= 1 || throw(ArgumentError("points collection must be nonempty"))
     if m == 1
@@ -174,31 +234,72 @@ function find_circumcenter!(CC::AbstractVector{T}, points) where {T<:AbstractFlo
     end
 
     dimG = m - 1
-    directions = [points[i] - points[1] for i in 2:m]
-    b = Vector{T}(undef, dimG)
-    for i in 1:dimG
-        b[i] = dot(directions[i], directions[i])
-    end
+    p1 = points[1]
+    dirs = isnothing(directions) ? [similar(p1) for _ in 1:dimG] : directions
+    b_vec = isnothing(b) ? Vector{T}(undef, dimG) : b
+    G_mat = isnothing(G) ? Matrix{T}(undef, dimG, dimG) : G
 
-    G = diagm(b)
-    for i in 1:(dimG - 1)
-        for j in (i + 1):dimG
-            val = dot(directions[i], directions[j])
-            G[i, j] = val
-            G[j, i] = val
+    if threaded && dimG >= 16
+        Threads.@threads :static for i in 1:dimG
+            @inbounds begin
+                di = dirs[i]
+                pi = points[i + 1]
+                @simd for k in eachindex(di, pi, p1)
+                    di[k] = pi[k] - p1[k]
+                end
+                val_ii = dot(di, di)
+                b_vec[i] = val_ii
+                G_mat[i, i] = val_ii
+            end
+        end
+        Threads.@threads :static for i in 1:(dimG - 1)
+            @inbounds begin
+                di = dirs[i]
+                for j in (i + 1):dimG
+                    val = dot(di, dirs[j])
+                    G_mat[i, j] = val
+                    G_mat[j, i] = val
+                end
+            end
+        end
+    else
+        @inbounds for i in 1:dimG
+            di = dirs[i]
+            pi = points[i + 1]
+            @simd for k in eachindex(di, pi, p1)
+                di[k] = pi[k] - p1[k]
+            end
+            val_ii = dot(di, di)
+            b_vec[i] = val_ii
+            G_mat[i, i] = val_ii
+        end
+        @inbounds for i in 1:(dimG - 1)
+            di = dirs[i]
+            for j in (i + 1):dimG
+                val = dot(di, dirs[j])
+                G_mat[i, j] = val
+                G_mat[j, i] = val
+            end
         end
     end
 
     coefficients = try
-        cholesky(Symmetric(G)) \ b
+        cholesky!(Symmetric(G_mat)) \ b_vec
     catch exception
         exception isa PosDefException || rethrow()
-        pinv(G) * b
+        # Reconstruct G_mat if cholesky! modified its upper triangle before failing
+        @inbounds for i in 1:dimG
+            G_mat[i, i] = b_vec[i]
+            for j in (i + 1):dimG
+                G_mat[i, j] = G_mat[j, i]
+            end
+        end
+        pinv(G_mat) * b_vec
     end
 
-    copyto!(CC, points[1])
-    for i in 1:dimG
-        axpy!(T(0.5) * coefficients[i], directions[i], CC)
+    copyto!(CC, p1)
+    @inbounds for i in 1:dimG
+        axpy!(T(0.5) * coefficients[i], dirs[i], CC)
     end
     return CC
 end
@@ -210,6 +311,68 @@ Returns a newly allocated vector containing the circumcenter of `points`.
 """
 function circumcenter(points)
     return find_circumcenter!(similar(points[1]), points)
+end
+
+function step!(
+    x_next::AbstractVector{T},
+    method::Symbol,
+    x::AbstractVector{T},
+    projections,
+    threaded::Bool,
+    points::Vector{Vector{T}},
+    directions::Vector{Vector{T}},
+    G::Matrix{T},
+    b_gram::Vector{T};
+    weights::Union{Nothing,AbstractVector} = nothing,
+    p0::Real = zero(T)
+) where {T<:AbstractFloat}
+    num_blocks = length(projections)
+    if method == :CRM
+        copyto!(points[1], x)
+        @inbounds for i in 1:num_blocks
+            apply_reflection!(points[i + 1], projections[i], points[i])
+        end
+        return find_circumcenter!(x_next, points; directions=directions, G=G, b=b_gram, threaded=false)
+    elseif method == :pCRM
+        copyto!(points[1], x)
+        if threaded
+            Threads.@threads :static for i in 1:num_blocks
+                @inbounds apply_reflection!(points[i + 1], projections[i], x)
+            end
+        else
+            @inbounds for i in 1:num_blocks
+                apply_reflection!(points[i + 1], projections[i], x)
+            end
+        end
+        return find_circumcenter!(x_next, points; directions=directions, G=G, b=b_gram, threaded=threaded)
+    elseif method in (:SPM, :FSPM)
+        if threaded
+            Threads.@threads :static for i in 1:num_blocks
+                @inbounds apply_projection!(points[i], projections[i], x)
+            end
+        else
+            @inbounds for i in 1:num_blocks
+                apply_projection!(points[i], projections[i], x)
+            end
+        end
+        fill!(x_next, zero(T))
+        if p0 != 0
+            axpy!(T(p0), x, x_next)
+        end
+        if isnothing(weights)
+            w = (one(T) - T(p0)) / num_blocks
+            @inbounds for i in 1:num_blocks
+                axpy!(w, points[i], x_next)
+            end
+        else
+            length(weights) == num_blocks || throw(DimensionMismatch("weights length must match projections length"))
+            @inbounds for i in 1:num_blocks
+                axpy!(T(weights[i]), points[i], x_next)
+            end
+        end
+        return x_next
+    end
+    throw(ArgumentError("unknown method: $method (expected :CRM, :pCRM, :SPM, or :FSPM)"))
 end
 
 """
@@ -228,41 +391,13 @@ function step(
     p0::Real = zero(T)
 ) where {T<:AbstractFloat}
     num_blocks = length(projections)
-    if method == :CRM
-        points = Vector{ Vector{T} }(undef, num_blocks + 1)
-        points[1] = copy(x)
-        reflected = x
-        for (i, project) in enumerate(projections)
-            reflected = 2 * project(reflected) - reflected
-            points[i + 1] = reflected
-        end
-        return circumcenter(points)
-    elseif method == :pCRM
-        reflect = project -> 2 * project(x) - x
-        reflected = threaded ? ThreadsX.map(reflect, projections; basesize=1) : map(reflect, projections)
-        # Keep the current iterate x at index 1 as the anchor of the affine hull W_x.
-        return circumcenter(vcat([x], reflected))
-    elseif method in (:SPM, :FSPM)
-        projected = threaded ? ThreadsX.map(project -> project(x), projections; basesize=1) :
-                               map(project -> project(x), projections)
-        combined = zeros(T, length(x))
-        if p0 != 0
-            axpy!(T(p0), x, combined)
-        end
-        if isnothing(weights)
-            w = (one(T) - T(p0)) / num_blocks
-            for point in projected
-                axpy!(w, point, combined)
-            end
-        else
-            length(weights) == num_blocks || throw(DimensionMismatch("weights length must match projections length"))
-            for (w, point) in zip(weights, projected)
-                axpy!(T(w), point, combined)
-            end
-        end
-        return combined
-    end
-    throw(ArgumentError("unknown method: $method (expected :CRM, :pCRM, :SPM, or :FSPM)"))
+    n = length(x)
+    points = [Vector{T}(undef, n) for _ in 1:(num_blocks + 1)]
+    directions = [Vector{T}(undef, n) for _ in 1:num_blocks]
+    G = Matrix{T}(undef, num_blocks, num_blocks)
+    b_gram = Vector{T}(undef, num_blocks)
+    x_next = similar(x)
+    return step!(x_next, method, x, projections, threaded, points, directions, G, b_gram; weights=weights, p0=p0)
 end
 
 """
@@ -291,17 +426,28 @@ function solve(
     norm_solution = norm(xSol)
     isfinite(norm_solution) && norm_solution > 0 || throw(ArgumentError("xSol must have finite, positive norm"))
 
+    n = length(x0)
+    num_blocks = length(projections)
     x = copy(x0)
-    relative_error = norm(x - xSol) / norm_solution
+    x_next = similar(x)
+    diff = similar(x)
+    points = [Vector{T}(undef, n) for _ in 1:(num_blocks + 1)]
+    directions = [Vector{T}(undef, n) for _ in 1:num_blocks]
+    G = Matrix{T}(undef, num_blocks, num_blocks)
+    b_gram = Vector{T}(undef, num_blocks)
+
+    @. diff = x - xSol
+    relative_error = norm(diff) / norm_solution
     iterations = 0
     projections_used = 0
-    num_blocks = length(projections)
 
     while isfinite(relative_error) && relative_error > EPSVAL && iterations < itmax
-        x = step(method, x, projections, threaded; weights=weights, p0=p0)
+        step!(x_next, method, x, projections, threaded, points, directions, G, b_gram; weights=weights, p0=p0)
+        copyto!(x, x_next)
         iterations += 1
         projections_used += num_blocks
-        relative_error = norm(x - xSol) / norm_solution
+        @. diff = x - xSol
+        relative_error = norm(diff) / norm_solution
     end
 
     converged = isfinite(relative_error) && relative_error <= EPSVAL

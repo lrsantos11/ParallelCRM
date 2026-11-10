@@ -15,6 +15,8 @@ using TOML
 function parse_options(args)
     options = Dict{String,Any}(
         "smoke" => false,
+        "serial" => false,
+        "both" => true,
         "seed" => 42,
         "samples" => 5,
         "seconds" => 300.0,
@@ -27,6 +29,14 @@ function parse_options(args)
     for arg in args
         if arg == "--smoke"
             options["smoke"] = true
+        elseif arg == "--serial"
+            options["serial"] = true
+            options["both"] = false
+        elseif arg == "--parallel-only"
+            options["serial"] = false
+            options["both"] = false
+        elseif arg == "--both"
+            options["both"] = true
         elseif arg == "--no-overwrite"
             options["overwrite"] = false
         elseif arg == "--help"
@@ -35,6 +45,9 @@ function parse_options(args)
 
             Options:
               --smoke                 Run a quick smoke test on small matrices (m=120, n=20)
+              --both                  Run both serial (threads=1) and parallel (threads=N) passes in one session (default when N > 1)
+              --serial                Force only the serial (1-thread) pass even if Julia has N > 1 threads
+              --parallel-only         Run only the parallel (N-thread) pass
               --seed=42               MersenneTwister random seed (default: 42)
               --samples=5             Number of BenchmarkTools samples per method/instance (default: 5)
               --repetitions=5         Alias for --samples
@@ -57,8 +70,8 @@ function parse_options(args)
                 options[key] = parse(Float64, value)
             elseif key in ("output-dir", "accelerator", "stat")
                 options[key] = String(value)
-            elseif key == "overwrite"
-                options["overwrite"] = parse(Bool, value)
+            elseif key in ("overwrite", "serial", "both")
+                options[key] = parse(Bool, value)
             else
                 error("Unknown option: $arg")
             end
@@ -124,21 +137,12 @@ function machine_information(active_accelerator::String)
     )
 end
 
-function run_experiments(args=ARGS)
-    options = parse_options(args)
-    isnothing(options) && return
-
-    active_accelerator = configure_accelerator!(
-        accelerator = Symbol(options["accelerator"]),
-        blas_threads = options["blas-threads"],
-        verbose = true
-    )
-
-    nt = Threads.nthreads()
+function run_single_pass(nt::Int, run_tag::String, options::Dict{String,Any}, active_accelerator::String)
     outdir = abspath(options["output-dir"])
     mkpath(outdir)
-    raw_filename = savename("raw", (threads=nt,), "csv"; equals="", sort=false)
-    meta_filename = savename("metadata", (threads=nt,), "toml"; equals="", sort=false)
+    params = (date=run_tag, threads=nt)
+    raw_filename = savename("raw", params, "csv"; sort=false)
+    meta_filename = savename("metadata", params, "toml"; sort=false)
     raw_path = joinpath(outdir, raw_filename)
     metadata_path = joinpath(outdir, meta_filename)
     if !options["overwrite"] && any(isfile, [raw_path, metadata_path])
@@ -149,8 +153,8 @@ function run_experiments(args=ARGS)
     max_seconds = options["seconds"]
     smoke = options["smoke"]
     mode = smoke ? "smoke" : "full"
-    row_counts = smoke ? [120] : [5000, 7500, 10000, 12500]
-    col_counts = smoke ? [20] : [100, 250, 500]
+    row_counts = smoke ? [5000] : [5000, 7500, 10000, 12500]
+    col_counts = smoke ? [250] : [100, 250, 500]
     coherences = [0.0, 0.1, 0.2]
     tolerance = 1e-5
     iteration_limit = 10_000
@@ -179,10 +183,11 @@ function run_experiments(args=ARGS)
         "source_dirty_or_untracked" => dirty,
         "julia_version" => string(VERSION),
         "julia_threads" => nt,
+        "julia_process_threads" => Threads.nthreads(),
         "blas_threads" => BLAS.get_num_threads(),
         "accelerator" => active_accelerator,
         "seed" => options["seed"],
-        "rng" => "MersenneTwister (private; regenerated identically in each process)",
+        "rng" => "MersenneTwister (private; regenerated identically in each pass)",
         "mode" => mode,
         "rows" => row_counts,
         "columns" => col_counts,
@@ -209,7 +214,7 @@ function run_experiments(args=ARGS)
     rng = MersenneTwister(options["seed"])
     raw = DataFrame()
 
-    # The serial run (threads=1) executes CRM, P-CRM, and F-SPM.
+    # The serial run (threads=1) executes CRM, P-CRM, and F-SPM with threaded=false.
     # Multithreaded runs (threads>1) execute P-CRM and F-SPM in parallel across blocks.
     methods = nt == 1 ? [:pCRM, :CRM, :SPM] : [:pCRM, :SPM]
     labels = Dict(:pCRM => "P-CRM", :CRM => "CRM", :SPM => "F-SPM (uniform weights)")
@@ -290,13 +295,55 @@ function run_experiments(args=ARGS)
     end
 
     stat_sym = Symbol(options["stat"])
-    summary_prefix = joinpath(outdir, savename("table1", (threads=nt,); equals="", sort=false))
+    summary_prefix = joinpath(outdir, savename("table1", params; sort=false))
     aggregate_table1([raw_path], summary_prefix; require_full=false, stat=stat_sym, show_table=true)
     metadata["complete"] = true
     metadata["finished_utc"] = string(now(UTC))
     metadata["timed_solves"] = nrow(raw)
     save_metadata()
     println("Saved $raw_path and $metadata_path")
+    return raw_path
+end
+
+function run_experiments(args=ARGS)
+    options = parse_options(args)
+    isnothing(options) && return
+
+    active_accelerator = configure_accelerator!(
+        accelerator = Symbol(options["accelerator"]),
+        blas_threads = options["blas-threads"],
+        verbose = true
+    )
+
+    nt_proc = Threads.nthreads()
+    if options["serial"] || nt_proc == 1
+        thread_passes = [1]
+    elseif options["both"]
+        thread_passes = [1, nt_proc]
+    else
+        thread_passes = [nt_proc]
+    end
+
+    run_tag = Dates.format(now(), "yyyy-mm-dd_HHMMSS")
+    raw_paths = String[]
+    for nt in thread_passes
+        println("\n=== Running pass with threads = $nt (date=$run_tag) ===")
+        push!(raw_paths, run_single_pass(nt, run_tag, options, active_accelerator))
+    end
+
+    if length(raw_paths) == 2
+        outdir = abspath(options["output-dir"])
+        stat_sym = Symbol(options["stat"])
+        dated_prefix = joinpath(outdir, savename("table1", (date=run_tag,); sort=false))
+        latest_prefix = joinpath(outdir, "table1")
+        println("\n=== Generating combined Table 1 (date=$run_tag, threads = 1 and threads = $nt_proc) ===")
+        aggregate_table1(raw_paths, dated_prefix; require_full=!options["smoke"], stat=stat_sym, show_table=true)
+        aggregate_table1(raw_paths, latest_prefix; require_full=!options["smoke"], stat=stat_sym, show_table=false)
+        println("Combined Table 1 written to:")
+        println("  - $(dated_prefix).tex / $(dated_prefix).csv")
+        println("  - $(latest_prefix).tex / $(latest_prefix).csv (latest alias)")
+    end
+    return raw_paths
 end
 
 if abspath(PROGRAM_FILE) == (@__FILE__)
