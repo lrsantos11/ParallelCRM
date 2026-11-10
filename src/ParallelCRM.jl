@@ -119,16 +119,18 @@ function form_Affine_blocks(A::AbstractMatrix, b::AbstractVector, num_blocks::In
 end
 
 """
-    BlockQRProjection{T,MT,VT,FT}
+    BlockQRProjection{T,MT,VT}
 
 Callable struct computing the orthogonal projection onto the affine subspace `{x : A*x = b}`
-using a precomputed column-pivoted QR factorization of `A'` and block-private work buffers.
+using a precomputed column-pivoted thin QR factorization of `A'` and block-private work buffers.
 Supports both out-of-place `P(x)` and zero-allocation in-place `P(out, x)` evaluation.
 """
-struct BlockQRProjection{T<:AbstractFloat,MT<:AbstractMatrix{T},VT<:AbstractVector{T},FT}
+struct BlockQRProjection{T<:AbstractFloat,MT<:AbstractMatrix{T},VT<:AbstractVector{T}}
     A::MT
-    b::VT
-    F::FT
+    b_piv::VT
+    Q::Matrix{T}
+    Rt::Matrix{T}
+    piv::Vector{Int}
     rhs::Vector{T}
     correction::Vector{T}
     coordinates::Vector{T}
@@ -136,10 +138,11 @@ end
 
 @inline function (P::BlockQRProjection{T})(out::AbstractVector{T}, x::AbstractVector{T}) where {T<:AbstractFloat}
     iszero(x) ? fill!(P.rhs, zero(T)) : mul!(P.rhs, P.A, x)
-    axpy!(-one(T), P.b, P.rhs)
-    @views rhspivoted = P.rhs[P.F.p]
-    ldiv!(P.coordinates, LowerTriangular(P.F.R'), rhspivoted)
-    mul!(P.correction, P.F.Q, P.coordinates)
+    @inbounds @simd for k in eachindex(P.coordinates, P.piv, P.b_piv)
+        P.coordinates[k] = P.rhs[P.piv[k]] - P.b_piv[k]
+    end
+    ldiv!(LowerTriangular(P.Rt), P.coordinates)
+    mul!(P.correction, P.Q, P.coordinates)
     @inbounds @simd for j in eachindex(out, x, P.correction)
         out[j] = x[j] - P.correction[j]
     end
@@ -180,22 +183,25 @@ end
     projection_factory(A, b)
 
 Creates a `BlockQRProjection` callable struct computing the orthogonal projection onto the
-affine subspace `{x : A*x = b}` using a precomputed column-pivoted QR factorization of `A'`
-and block-private work buffers. Because each instance owns its buffers and shares a concrete
-type, distinct blocks can be evaluated concurrently across threads without dynamic dispatch
-or heap allocations.
+affine subspace `{x : A*x = b}` using a precomputed column-pivoted thin QR factorization of `A'`
+and block-private work buffers. Because each instance owns its buffers and uses explicit dense
+`Q` and `R'` factors, distinct blocks can be evaluated concurrently across threads using pure
+BLAS-2 operations with zero heap allocations.
 """
 function projection_factory(A::AbstractMatrix{T}, b::AbstractVector{T}) where {T<:AbstractFloat}
     rows, cols = size(A)
     length(b) == rows || throw(DimensionMismatch("A and b row counts differ"))
     rows <= cols || throw(ArgumentError("projection_factory requires blocks with rows <= cols (got ($rows, $cols))"))
     A_mat = Matrix{T}(A)
-    b_vec = Vector{T}(b)
     F = qr(transpose(A_mat), ColumnNorm())
+    piv = Vector{Int}(F.p)
+    b_piv = Vector{T}(b[piv])
+    Q_thin = Matrix{T}(F.Q)[:, 1:rows]
+    Rt = Matrix{T}(transpose(F.R))
     rhs = Vector{T}(undef, rows)
     correction = Vector{T}(undef, cols)
     coordinates = Vector{T}(undef, rows)
-    return BlockQRProjection{T,Matrix{T},Vector{T},typeof(F)}(A_mat, b_vec, F, rhs, correction, coordinates)
+    return BlockQRProjection{T,Matrix{T},Vector{T}}(A_mat, b_piv, Q_thin, Rt, piv, rhs, correction, coordinates)
 end
 
 """
@@ -266,7 +272,7 @@ function find_circumcenter!(
     b_vec = isnothing(b) ? Vector{T}(undef, dimG) : b
     G_mat = isnothing(G) ? Matrix{T}(undef, dimG, dimG) : G
 
-    if threaded && dimG >= 16
+    if threaded && dimG * n_dim >= 8_000
         Threads.@threads :static for i in 1:dimG
             @inbounds begin
                 di = dirs[i]
@@ -279,13 +285,12 @@ function find_circumcenter!(
                 G_mat[i, i] = val_ii
             end
         end
-        Threads.@threads :static for i in 1:(dimG - 1)
+        # Iterate by column j (column-major contiguous writes in upper triangle) to prevent cache-line false sharing
+        Threads.@threads :static for j in 2:dimG
             @inbounds begin
-                di = dirs[i]
-                for j in (i + 1):dimG
-                    val = dot(di, dirs[j])
-                    G_mat[i, j] = val
-                    G_mat[j, i] = val
+                dj = dirs[j]
+                for i in 1:(j - 1)
+                    G_mat[i, j] = dot(dirs[i], dj)
                 end
             end
         end
@@ -300,12 +305,10 @@ function find_circumcenter!(
             b_vec[i] = val_ii
             G_mat[i, i] = val_ii
         end
-        @inbounds for i in 1:(dimG - 1)
-            di = dirs[i]
-            for j in (i + 1):dimG
-                val = dot(di, dirs[j])
-                G_mat[i, j] = val
-                G_mat[j, i] = val
+        @inbounds for j in 2:dimG
+            dj = dirs[j]
+            for i in 1:(j - 1)
+                G_mat[i, j] = dot(dirs[i], dj)
             end
         end
     end
@@ -315,12 +318,18 @@ function find_circumcenter!(
         !isnothing(fallback_counter) && (fallback_counter[] += 1)
         symmetric_pinv_solve!(G_mat, b_vec)
     else
+        # Backup upper triangle into lower triangle before cholesky! overwrites upper triangle
+        @inbounds for j in 2:dimG
+            for i in 1:(j - 1)
+                G_mat[j, i] = G_mat[i, j]
+            end
+        end
         try
-            cholesky!(Symmetric(G_mat)) \ b_vec
+            cholesky!(Symmetric(G_mat, :U)) \ b_vec
         catch exception
             exception isa PosDefException || rethrow()
             !isnothing(fallback_counter) && (fallback_counter[] += 1)
-            # Reconstruct G_mat upper triangle modified by failed cholesky!
+            # Reconstruct G_mat upper triangle from lower triangle backup
             @inbounds for i in 1:dimG
                 G_mat[i, i] = b_vec[i]
                 for j in (i + 1):dimG
