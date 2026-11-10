@@ -258,6 +258,7 @@ function run_single_pass(nt::Int, run_tag::String, options::Dict{String,Any}, ac
                     coherence = c,
                     iterations = reference.iterations,
                     projections = reference.projections,
+                    cholesky_fallbacks = reference.cholesky_fallbacks,
                     relative_error = measured_error,
                     converged = reference.converged,
                     status = reference.status,
@@ -287,7 +288,7 @@ function run_single_pass(nt::Int, run_tag::String, options::Dict{String,Any}, ac
             min_ms = (minimum(trial.times) / 1e6)
             med_ms = (median(trial.times) / 1e6)
             println("[$mode] $(labels[method]) (threads=$nt), size=($m,$n), blocks=$blocks, c=$c: ",
-                    "iter=$(reference.iterations), proj=$(reference.projections), ",
+                    "iter=$(reference.iterations), proj=$(reference.projections), fallbacks=$(reference.cholesky_fallbacks), ",
                     "min=$(round(min_ms, digits=3)) ms, median=$(round(med_ms, digits=3)) ms, ",
                     "err=$(round(reference.relative_error, sigdigits=3))")
             flush(stdout)

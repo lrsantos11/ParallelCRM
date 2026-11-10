@@ -208,8 +208,33 @@ function projection_block_QR(A::AbstractMatrix, b::AbstractVector, blocks::Int)
     return form_Affine_blocks(A, b, blocks, projection_factory)
 end
 
+function symmetric_pinv_solve!(G_mat::Matrix{T}, b_vec::Vector{T}) where {T<:AbstractFloat}
+    dimG = length(b_vec)
+    try
+        F = eigen!(Symmetric(G_mat))
+        max_ev = maximum(abs, F.values)
+        if !(isfinite(max_ev) && max_ev > zero(T))
+            return fill(one(T) / dimG, dimG)
+        end
+        cutoff = dimG * eps(T) * max_ev
+        vt_b = F.vectors' * b_vec
+        @inbounds for i in eachindex(vt_b, F.values)
+            λ = F.values[i]
+            vt_b[i] = λ > cutoff ? (vt_b[i] / λ) : zero(T)
+        end
+        return F.vectors * vt_b
+    catch
+        try
+            return qr(G_mat, ColumnNorm()) \ b_vec
+        catch
+            # Fallback to Cimmino step (average of projections: coefficients = 1 / dimG)
+            return fill(one(T) / dimG, dimG)
+        end
+    end
+end
+
 """
-    find_circumcenter!(CC, points; directions=nothing, G=nothing, b=nothing, threaded::Bool=false)
+    find_circumcenter!(CC, points; directions=nothing, G=nothing, b=nothing, threaded::Bool=false, fallback_counter=nothing)
 
 Computes the circumcenter of the points in `points` and stores the result in `CC`.
 `points[1]` is used as the anchor point to construct the Gram matrix. Optional preallocated
@@ -221,7 +246,8 @@ function find_circumcenter!(
     directions::Union{Nothing,Vector{Vector{T}}} = nothing,
     G::Union{Nothing,Matrix{T}} = nothing,
     b::Union{Nothing,Vector{T}} = nothing,
-    threaded::Bool = false
+    threaded::Bool = false,
+    fallback_counter::Union{Nothing,Base.RefValue{Int}} = nothing
 ) where {T<:AbstractFloat}
     m = length(points)
     m >= 1 || throw(ArgumentError("points collection must be nonempty"))
@@ -235,6 +261,7 @@ function find_circumcenter!(
 
     dimG = m - 1
     p1 = points[1]
+    n_dim = length(p1)
     dirs = isnothing(directions) ? [similar(p1) for _ in 1:dimG] : directions
     b_vec = isnothing(b) ? Vector{T}(undef, dimG) : b
     G_mat = isnothing(G) ? Matrix{T}(undef, dimG, dimG) : G
@@ -283,18 +310,25 @@ function find_circumcenter!(
         end
     end
 
-    coefficients = try
-        cholesky!(Symmetric(G_mat)) \ b_vec
-    catch exception
-        exception isa PosDefException || rethrow()
-        # Reconstruct G_mat if cholesky! modified its upper triangle before failing
-        @inbounds for i in 1:dimG
-            G_mat[i, i] = b_vec[i]
-            for j in (i + 1):dimG
-                G_mat[i, j] = G_mat[j, i]
+    coefficients = if dimG > n_dim
+        # Rank(G) <= n_dim < dimG, so G is guaranteed singular; skip Cholesky exception overhead
+        !isnothing(fallback_counter) && (fallback_counter[] += 1)
+        symmetric_pinv_solve!(G_mat, b_vec)
+    else
+        try
+            cholesky!(Symmetric(G_mat)) \ b_vec
+        catch exception
+            exception isa PosDefException || rethrow()
+            !isnothing(fallback_counter) && (fallback_counter[] += 1)
+            # Reconstruct G_mat upper triangle modified by failed cholesky!
+            @inbounds for i in 1:dimG
+                G_mat[i, i] = b_vec[i]
+                for j in (i + 1):dimG
+                    G_mat[i, j] = G_mat[j, i]
+                end
             end
+            symmetric_pinv_solve!(G_mat, b_vec)
         end
-        pinv(G_mat) * b_vec
     end
 
     copyto!(CC, p1)
@@ -324,7 +358,8 @@ function step!(
     G::Matrix{T},
     b_gram::Vector{T};
     weights::Union{Nothing,AbstractVector} = nothing,
-    p0::Real = zero(T)
+    p0::Real = zero(T),
+    fallback_counter::Union{Nothing,Base.RefValue{Int}} = nothing
 ) where {T<:AbstractFloat}
     num_blocks = length(projections)
     if method == :CRM
@@ -332,7 +367,7 @@ function step!(
         @inbounds for i in 1:num_blocks
             apply_reflection!(points[i + 1], projections[i], points[i])
         end
-        return find_circumcenter!(x_next, points; directions=directions, G=G, b=b_gram, threaded=false)
+        return find_circumcenter!(x_next, points; directions=directions, G=G, b=b_gram, threaded=false, fallback_counter=fallback_counter)
     elseif method == :pCRM
         copyto!(points[1], x)
         if threaded
@@ -344,7 +379,7 @@ function step!(
                 apply_reflection!(points[i + 1], projections[i], x)
             end
         end
-        return find_circumcenter!(x_next, points; directions=directions, G=G, b=b_gram, threaded=threaded)
+        return find_circumcenter!(x_next, points; directions=directions, G=G, b=b_gram, threaded=threaded, fallback_counter=fallback_counter)
     elseif method in (:SPM, :FSPM)
         if threaded
             Threads.@threads :static for i in 1:num_blocks
@@ -440,9 +475,11 @@ function solve(
     relative_error = norm(diff) / norm_solution
     iterations = 0
     projections_used = 0
+    fallback_counter = Ref(0)
 
     while isfinite(relative_error) && relative_error > EPSVAL && iterations < itmax
-        step!(x_next, method, x, projections, threaded, points, directions, G, b_gram; weights=weights, p0=p0)
+        step!(x_next, method, x, projections, threaded, points, directions, G, b_gram;
+              weights=weights, p0=p0, fallback_counter=fallback_counter)
         copyto!(x, x_next)
         iterations += 1
         projections_used += num_blocks
@@ -457,6 +494,7 @@ function solve(
         x = x,
         iterations = iterations,
         projections = projections_used,
+        cholesky_fallbacks = fallback_counter[],
         relative_error = relative_error,
         converged = converged,
         status = status,
