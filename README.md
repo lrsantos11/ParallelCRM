@@ -36,10 +36,11 @@ ParallelCRM/
 ├── Project.toml                  # Lightweight Julia environment (DrWatson, BenchmarkTools, ThreadsX, etc.)
 ├── README.md                     # Documentation and reproduction instructions
 ├── src/
-│   └── ParallelCRM.jl            # Core module: balanced partitions, QR projectors, circumcenter, CRM, P-CRM, F-SPM
+│   ├── ParallelCRM.jl            # Core module: balanced partitions, QR projectors, circumcenter, CRM, P-CRM, F-SPM
+│   └── reporting.jl              # Table 1 validation, statistical aggregation, and LaTeX/CSV formatting
 ├── scripts/
-│   ├── run_experiments.jl        # Benchmark runner using BenchmarkTools.jl
-│   └── make_table1.jl            # Table 1 aggregator (CSV, LaTeX with boldface highlights, and summary stats)
+│   ├── run_experiments.jl        # Benchmark runner using DrWatson.jl and BenchmarkTools.jl
+│   └── make_table1.jl            # CLI entry point for Table 1 aggregation
 ├── test/
 │   └── runtests.jl               # Unit tests for partitions, stopping criteria, QR projectors, and multithreading
 └── data/

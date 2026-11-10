@@ -12,11 +12,6 @@ using SHA
 using Statistics
 using TOML
 
-include(joinpath(@__DIR__, "make_table1.jl"))
-using .Table1Reporting
-
-const PROJECT_ROOT = projectdir()
-
 function parse_options(args)
     options = Dict{String,Any}(
         "smoke" => false,
@@ -78,7 +73,7 @@ function file_fingerprint(paths)
     io = IOBuffer()
     for path in paths
         isfile(path) || error("Missing reproducibility file: $path")
-        write(io, relpath(path, PROJECT_ROOT), '\0', read(path), '\0')
+        write(io, relpath(path, projectdir()), '\0', read(path), '\0')
     end
     return bytes2hex(sha256(take!(io)))
 end
@@ -93,18 +88,20 @@ function instance_fingerprint(A, b, solution, ranges)
 end
 
 function git_information()
+    root = projectdir()
     paths = [
         "src/ParallelCRM.jl",
+        "src/reporting.jl",
         "scripts/run_experiments.jl",
         "scripts/make_table1.jl",
         "test/runtests.jl",
         "Project.toml"
     ]
     try
-        head = strip(read(pipeline(`git -C $PROJECT_ROOT rev-parse HEAD`; stderr=devnull), String))
-        changes = strip(read(pipeline(`git -C $PROJECT_ROOT status --porcelain -- $paths`; stderr=devnull), String))
+        head = strip(read(pipeline(`git -C $root rev-parse HEAD`; stderr=devnull), String))
+        changes = strip(read(pipeline(`git -C $root status --porcelain -- $paths`; stderr=devnull), String))
         tracked = all(paths) do path
-            success(pipeline(`git -C $PROJECT_ROOT ls-files --error-unmatch $path`; stdout=devnull, stderr=devnull))
+            success(pipeline(`git -C $root ls-files --error-unmatch $path`; stdout=devnull, stderr=devnull))
         end
         return head, !isempty(changes) || !tracked
     catch
@@ -140,8 +137,10 @@ function run_experiments(args=ARGS)
     nt = Threads.nthreads()
     outdir = abspath(options["output-dir"])
     mkpath(outdir)
-    raw_path = joinpath(outdir, "raw_threads$(nt).csv")
-    metadata_path = joinpath(outdir, "metadata_threads$(nt).toml")
+    raw_filename = savename("raw", (threads=nt,), "csv"; equals="", sort=false)
+    meta_filename = savename("metadata", (threads=nt,), "toml"; equals="", sort=false)
+    raw_path = joinpath(outdir, raw_filename)
+    metadata_path = joinpath(outdir, meta_filename)
     if !options["overwrite"] && any(isfile, [raw_path, metadata_path])
         error("Outputs already exist in $outdir; choose a new --output-dir or omit --no-overwrite")
     end
@@ -158,6 +157,7 @@ function run_experiments(args=ARGS)
 
     sources = [
         srcdir("ParallelCRM.jl"),
+        srcdir("reporting.jl"),
         scriptsdir("run_experiments.jl"),
         scriptsdir("make_table1.jl"),
         projectdir("test", "runtests.jl"),
@@ -278,7 +278,7 @@ function run_experiments(args=ARGS)
                 ); cols=:union)
             end
 
-            CSV.write(raw_path, raw)
+            wsave(raw_path, raw)
             min_ms = (minimum(trial.times) / 1e6)
             med_ms = (median(trial.times) / 1e6)
             println("[$mode] $(labels[method]) (threads=$nt), size=($m,$n), blocks=$blocks, c=$c: ",
@@ -290,7 +290,8 @@ function run_experiments(args=ARGS)
     end
 
     stat_sym = Symbol(options["stat"])
-    aggregate_table1([raw_path], joinpath(outdir, "table1_threads$(nt)"); require_full=false, stat=stat_sym, show_table=true)
+    summary_prefix = joinpath(outdir, savename("table1", (threads=nt,); equals="", sort=false))
+    aggregate_table1([raw_path], summary_prefix; require_full=false, stat=stat_sym, show_table=true)
     metadata["complete"] = true
     metadata["finished_utc"] = string(now(UTC))
     metadata["timed_solves"] = nrow(raw)

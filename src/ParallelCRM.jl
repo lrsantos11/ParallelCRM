@@ -21,7 +21,8 @@ export Results,
        CRM,
        pCRM,
        FSPM,
-       SPM
+       SPM,
+       aggregate_table1
 
 """
     Results
@@ -408,5 +409,7 @@ function FSPM(
 end
 
 const SPM = FSPM
+
+include("reporting.jl")
 
 end # module ParallelCRM

@@ -1,3 +1,6 @@
+using DrWatson
+@quickactivate "ParallelCRM"
+
 using Test
 using LinearAlgebra
 using Random
@@ -5,12 +8,9 @@ using CSV
 using DataFrames
 using ParallelCRM
 
-include(joinpath(dirname(@__DIR__), "scripts", "make_table1.jl"))
-using .Table1Reporting
-
 configure_accelerator!(blas_threads=1, verbose=false)
 
-@testset "ParallelCRM Test Suite" begin
+@testset verbose=true "ParallelCRM Test Suite" begin
 
     @testset "Balanced, nonempty partitions" begin
         for (rows, blocks) in [(10000, 101), (12500, 126), (5000, 11), (7, 7), (13, 1)]
@@ -133,8 +133,8 @@ configure_accelerator!(blas_threads=1, verbose=false)
                     mode="smoke"
                 ); cols=:union)
             end
-            path = joinpath(dir, "raw.csv")
-            CSV.write(path, data)
+            path = joinpath(dir, savename("raw", (threads=1,), "csv"; equals=""))
+            wsave(path, data)
             summary_min = aggregate_table1([path], joinpath(dir, "table_min"); require_full=false, stat=:min, show_table=false)
             @test only(summary_min.iterations) == 3
             @test only(summary_min.projections) == 21
