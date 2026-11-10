@@ -152,7 +152,7 @@ function find_reusable_full_data(outdir::String, nt::Int, seed::Int, samples::In
     for path in reverse(all_raw)
         try
             df = CSV.read(path, DataFrame)
-            if nrow(df) > 0 && all(df.seed .== seed) && all(df.repetitions .== samples) && any(df.mode .== "full")
+            if nrow(df) > 0 && all(df.seed .== seed) && all(df.repetitions .== samples) && any(m -> m in ("full", "large"), df.mode)
                 return df, path
             end
         catch
@@ -182,7 +182,8 @@ function run_single_pass(nt::Int, run_tag::String, options::Dict{String,Any}, ac
     base_pairs = [(m, n) for m in [5000, 7500, 10000, 12500] for n in [100, 250, 500]]
     extra_large_pairs = vcat(
         [(m, 1000) for m in [5000, 7500, 10000, 12500]],
-        [(m, n) for m in [20000, 30000] for n in [250, 500, 1000]]
+        [(m, n) for m in [20000, 30000] for n in [250, 500, 1000]],
+        [(m, 100) for m in [20000, 30000]]
     )
     size_pairs = smoke ? [(5000, 250)] : (large ? vcat(base_pairs, extra_large_pairs) : base_pairs)
     row_counts = sort(unique(first.(size_pairs)))
