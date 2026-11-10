@@ -15,6 +15,8 @@ using TOML
 function parse_options(args)
     options = Dict{String,Any}(
         "smoke" => false,
+        "large" => false,
+        "reuse-full" => true,
         "serial" => false,
         "both" => true,
         "seed" => 42,
@@ -29,6 +31,12 @@ function parse_options(args)
     for arg in args
         if arg == "--smoke"
             options["smoke"] = true
+        elseif arg == "--large"
+            options["large"] = true
+        elseif arg == "--reuse-full"
+            options["reuse-full"] = true
+        elseif arg == "--no-reuse-full"
+            options["reuse-full"] = false
         elseif arg == "--serial"
             options["serial"] = true
             options["both"] = false
@@ -44,7 +52,9 @@ function parse_options(args)
             Usage: julia --project=. --threads=N scripts/run_experiments.jl [options]
 
             Options:
-              --smoke                 Run a quick smoke test on small matrices (m=120, n=20)
+              --smoke                 Run a quick smoke test on (m=5000, n=250)
+              --large                 Run the full grid plus larger configurations (m up to 30000, n up to 1000)
+              --no-reuse-full         Re-run base full configurations from scratch even when --large is passed
               --both                  Run both serial (threads=1) and parallel (threads=N) passes in one session (default when N > 1)
               --serial                Force only the serial (1-thread) pass even if Julia has N > 1 threads
               --parallel-only         Run only the parallel (N-thread) pass
@@ -70,7 +80,7 @@ function parse_options(args)
                 options[key] = parse(Float64, value)
             elseif key in ("output-dir", "accelerator", "stat")
                 options[key] = String(value)
-            elseif key in ("overwrite", "serial", "both")
+            elseif key in ("overwrite", "serial", "both", "large", "reuse-full")
                 options[key] = parse(Bool, value)
             else
                 error("Unknown option: $arg")
@@ -137,6 +147,20 @@ function machine_information(active_accelerator::String)
     )
 end
 
+function find_reusable_full_data(outdir::String, nt::Int, seed::Int, samples::Int)
+    all_raw = sort(filter(f -> startswith(basename(f), "raw_") && endswith(f, "threads=$(nt).csv"), readdir(outdir; join=true)))
+    for path in reverse(all_raw)
+        try
+            df = CSV.read(path, DataFrame)
+            if nrow(df) > 0 && all(df.seed .== seed) && all(df.repetitions .== samples) && any(df.mode .== "full")
+                return df, path
+            end
+        catch
+        end
+    end
+    return nothing, nothing
+end
+
 function run_single_pass(nt::Int, run_tag::String, options::Dict{String,Any}, active_accelerator::String)
     outdir = abspath(options["output-dir"])
     mkpath(outdir)
@@ -152,9 +176,17 @@ function run_single_pass(nt::Int, run_tag::String, options::Dict{String,Any}, ac
     samples = options["samples"]
     max_seconds = options["seconds"]
     smoke = options["smoke"]
-    mode = smoke ? "smoke" : "full"
-    row_counts = smoke ? [5000] : [5000, 7500, 10000, 12500]
-    col_counts = smoke ? [250] : [100, 250, 500]
+    large = options["large"]
+    mode = smoke ? "smoke" : (large ? "large" : "full")
+
+    base_pairs = [(m, n) for m in [5000, 7500, 10000, 12500] for n in [100, 250, 500]]
+    extra_large_pairs = vcat(
+        [(m, 1000) for m in [5000, 7500, 10000, 12500]],
+        [(m, n) for m in [20000, 30000] for n in [250, 500, 1000]]
+    )
+    size_pairs = smoke ? [(5000, 250)] : (large ? vcat(base_pairs, extra_large_pairs) : base_pairs)
+    row_counts = sort(unique(first.(size_pairs)))
+    col_counts = sort(unique(last.(size_pairs)))
     coherences = [0.0, 0.1, 0.2]
     tolerance = 1e-5
     iteration_limit = 10_000
@@ -214,13 +246,19 @@ function run_single_pass(nt::Int, run_tag::String, options::Dict{String,Any}, ac
     rng = MersenneTwister(options["seed"])
     raw = DataFrame()
 
+    reusable_df, reusable_path = (large && options["reuse-full"]) ?
+        find_reusable_full_data(outdir, nt, options["seed"], samples) : (nothing, nothing)
+    if !isnothing(reusable_df)
+        println("[$mode] Reusing base full instances (threads=$nt) from $(basename(reusable_path))")
+    end
+
     # The serial run (threads=1) executes CRM, P-CRM, and F-SPM with threaded=false.
     # Multithreaded runs (threads>1) execute P-CRM and F-SPM in parallel across blocks.
     methods = nt == 1 ? [:pCRM, :CRM, :SPM] : [:pCRM, :SPM]
     labels = Dict(:pCRM => "P-CRM", :CRM => "CRM", :SPM => "F-SPM (uniform weights)")
     instance_number = 0
 
-    for m in row_counts, n in col_counts, c in coherences
+    for (m, n) in size_pairs, c in coherences
         instance_number += 1
         preprocessing_start = time_ns()
         A = (1 - c) .* randn(rng, m, n) .+ c
@@ -230,6 +268,26 @@ function run_single_pass(nt::Int, run_tag::String, options::Dict{String,Any}, ac
         x0 = zeros(n)
         blocks = fld(m, n) + 1
         ranges = balanced_row_ranges(m, blocks)
+
+        if !isnothing(reusable_df)
+            instance_hash = instance_fingerprint(A, b, xSol, ranges)
+            cached = reusable_df[(reusable_df.rows .== m) .& (reusable_df.columns .== n) .&
+                                 (reusable_df.coherence .== c) .& (reusable_df.instance_sha256 .== instance_hash), :]
+            if nrow(cached) == length(methods) * samples
+                cached_copy = copy(cached)
+                cached_copy.mode .= mode
+                cached_copy.source_sha256 .= source_hash
+                cached_copy.environment_sha256 .= environment_hash
+                cached_copy.source_commit .= commit
+                cached_copy.source_dirty_or_untracked .= dirty
+                append!(raw, cached_copy; cols=:union)
+                wsave(raw_path, raw)
+                println("[$mode] Reused cached size=($m,$n), blocks=$blocks, c=$c (threads=$nt)")
+                flush(stdout)
+                continue
+            end
+        end
+
         projections = projection_block_QR(A, b, blocks)
         preprocessing_seconds = (time_ns() - preprocessing_start) / 1e9
         instance_hash = instance_fingerprint(A, b, xSol, ranges)

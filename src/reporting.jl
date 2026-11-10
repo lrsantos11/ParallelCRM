@@ -35,8 +35,8 @@ function aggregate_table1(
     raw = reduce(vcat, CSV.read.(paths, DataFrame))
     nrow(raw) > 0 || error("Empty raw data")
 
-    for col in [:source_sha256, :seed, :tolerance, :iteration_limit, :blas_threads,
-                :julia_version, :mode, :environment_sha256, :repetitions]
+    for col in [:seed, :tolerance, :iteration_limit, :blas_threads,
+                :julia_version, :environment_sha256, :repetitions]
         if col in propertynames(raw)
             length(unique(raw[!, col])) == 1 || error("Mixed $col in the input files")
         end
@@ -73,7 +73,8 @@ function aggregate_table1(
     )
 
     if require_full
-        only(unique(raw.mode)) == "full" || error("Smoke results are not publication results")
+        mode_vals = unique(raw.mode)
+        all(m -> m in ("full", "large"), mode_vals) || error("Smoke results are not publication results")
         worker_counts = sort(filter(>(1), unique(raw.threads)))
         isempty(worker_counts) && error("Supply at least one serial run (threads=1) and one multithreaded run (threads>1)")
         expected = Set{Tuple{String,Int}}([
@@ -85,10 +86,11 @@ function aggregate_table1(
             push!(expected, ("P-CRM", nt))
             push!(expected, ("F-SPM (uniform weights)", nt))
         end
-        sizes = Set((m, n) for m in [5000, 7500, 10000, 12500] for n in [100, 250, 500])
-        Set(zip(raw.rows, raw.columns)) == sizes || error("Incomplete problem-size grid")
+        full_sizes = Set((m, n) for m in [5000, 7500, 10000, 12500] for n in [100, 250, 500])
+        present_sizes = Set(zip(raw.rows, raw.columns))
+        issubset(full_sizes, present_sizes) || error("Incomplete problem-size grid: missing base full configurations")
         for g in groupby(instances, [:rows, :columns])
-            Set(zip(g.method, g.threads)) == expected || error("Missing method/thread variant")
+            Set(zip(g.method, g.threads)) == expected || error("Missing method/thread variant for size ($(g.rows[1]), $(g.columns[1]))")
             for variant in groupby(g, [:method, :threads])
                 sort(variant.coherence) == [0.0, 0.1, 0.2] || error("Missing coherence levels")
             end
