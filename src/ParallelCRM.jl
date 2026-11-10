@@ -240,11 +240,11 @@ function symmetric_pinv_solve!(G_mat::Matrix{T}, b_vec::Vector{T}) where {T<:Abs
 end
 
 """
-    find_circumcenter!(CC, points; directions=nothing, G=nothing, b=nothing, threaded::Bool=false, fallback_counter=nothing)
+    find_circumcenter!(CC, points; directions=nothing, G=nothing, b=nothing, D_mat=nothing, coeffs=nothing, threaded::Bool=false, fallback_counter=nothing)
 
 Computes the circumcenter of the points in `points` and stores the result in `CC`.
 `points[1]` is used as the anchor point to construct the Gram matrix. Optional preallocated
-buffers `directions`, `G`, and `b` avoid heap allocations inside iterative loops.
+buffers `directions`, `G`, `b`, `D_mat`, and `coeffs` avoid heap allocations inside iterative loops.
 """
 function find_circumcenter!(
     CC::AbstractVector{T},
@@ -252,6 +252,8 @@ function find_circumcenter!(
     directions::Union{Nothing,Vector{Vector{T}}} = nothing,
     G::Union{Nothing,Matrix{T}} = nothing,
     b::Union{Nothing,Vector{T}} = nothing,
+    D_mat::Union{Nothing,Matrix{T}} = nothing,
+    coeffs::Union{Nothing,Vector{T}} = nothing,
     threaded::Bool = false,
     fallback_counter::Union{Nothing,Base.RefValue{Int}} = nothing
 ) where {T<:AbstractFloat}
@@ -268,82 +270,86 @@ function find_circumcenter!(
     dimG = m - 1
     p1 = points[1]
     n_dim = length(p1)
-    dirs = isnothing(directions) ? [similar(p1) for _ in 1:dimG] : directions
     b_vec = isnothing(b) ? Vector{T}(undef, dimG) : b
-    G_mat = isnothing(G) ? Matrix{T}(undef, dimG, dimG) : G
+    D = (!isnothing(D_mat) && size(D_mat) == (n_dim, dimG)) ? D_mat : Matrix{T}(undef, n_dim, dimG)
+    c_vec = (!isnothing(coeffs) && length(coeffs) == dimG) ? coeffs : Vector{T}(undef, dimG)
 
-    if threaded && dimG * n_dim >= 8_000
+    if threaded && dimG * n_dim >= 16_000
         Threads.@threads :static for i in 1:dimG
             @inbounds begin
-                di = dirs[i]
                 pi = points[i + 1]
-                @simd for k in eachindex(di, pi, p1)
-                    di[k] = pi[k] - p1[k]
+                s = zero(T)
+                @simd for k in 1:n_dim
+                    val = pi[k] - p1[k]
+                    D[k, i] = val
+                    s += val * val
                 end
-                val_ii = dot(di, di)
-                b_vec[i] = val_ii
-                G_mat[i, i] = val_ii
-            end
-        end
-        # Iterate by column j (column-major contiguous writes in upper triangle) to prevent cache-line false sharing
-        Threads.@threads :static for j in 2:dimG
-            @inbounds begin
-                dj = dirs[j]
-                for i in 1:(j - 1)
-                    G_mat[i, j] = dot(dirs[i], dj)
-                end
+                b_vec[i] = s
             end
         end
     else
         @inbounds for i in 1:dimG
-            di = dirs[i]
             pi = points[i + 1]
-            @simd for k in eachindex(di, pi, p1)
-                di[k] = pi[k] - p1[k]
+            s = zero(T)
+            @simd for k in 1:n_dim
+                val = pi[k] - p1[k]
+                D[k, i] = val
+                s += val * val
             end
-            val_ii = dot(di, di)
-            b_vec[i] = val_ii
-            G_mat[i, i] = val_ii
-        end
-        @inbounds for j in 2:dimG
-            dj = dirs[j]
-            for i in 1:(j - 1)
-                G_mat[i, j] = dot(dirs[i], dj)
-            end
+            b_vec[i] = s
         end
     end
 
-    coefficients = if dimG > n_dim
-        # Rank(G) <= n_dim < dimG, so G is guaranteed singular; skip Cholesky exception overhead
+    if dimG > n_dim
+        # Overdetermined direction set (m - 1 > n): instead of forming and diagonalizing a singular
+        # dimG × dimG Gram matrix in O(dimG^3), solve the minimum-norm system D' * δ = 0.5 * b_vec
+        # directly in R^n via column-pivoted QR of D' (size dimG × n_dim, cost O(dimG * n_dim^2)).
         !isnothing(fallback_counter) && (fallback_counter[] += 1)
-        symmetric_pinv_solve!(G_mat, b_vec)
-    else
+        try
+            @inbounds @simd for i in 1:dimG
+                c_vec[i] = T(0.5) * b_vec[i]
+            end
+            delta = qr(transpose(D), ColumnNorm()) \ c_vec
+            @inbounds @simd for k in 1:n_dim
+                CC[k] = p1[k] + delta[k]
+            end
+            return CC
+        catch
+        end
+    end
+
+    G_mat = (!isnothing(G) && size(G) == (dimG, dimG)) ? G : Matrix{T}(undef, dimG, dimG)
+    # Fast BLAS Level-3 symmetric rank-k update: G_mat = D' * D (upper triangle)
+    BLAS.syrk!('U', 'T', one(T), D, zero(T), G_mat)
+
+    if dimG <= n_dim
         # Backup upper triangle into lower triangle before cholesky! overwrites upper triangle
         @inbounds for j in 2:dimG
             for i in 1:(j - 1)
                 G_mat[j, i] = G_mat[i, j]
             end
         end
-        try
-            cholesky!(Symmetric(G_mat, :U)) \ b_vec
-        catch exception
-            exception isa PosDefException || rethrow()
-            !isnothing(fallback_counter) && (fallback_counter[] += 1)
-            # Reconstruct G_mat upper triangle from lower triangle backup
-            @inbounds for i in 1:dimG
-                G_mat[i, i] = b_vec[i]
-                for j in (i + 1):dimG
-                    G_mat[i, j] = G_mat[j, i]
-                end
+        copyto!(c_vec, b_vec)
+        _, info = LAPACK.potrf!('U', G_mat)
+        if info == 0
+            LAPACK.potrs!('U', G_mat, c_vec)
+            copyto!(CC, p1)
+            mul!(CC, D, c_vec, T(0.5), one(T))
+            return CC
+        end
+        !isnothing(fallback_counter) && (fallback_counter[] += 1)
+        # Reconstruct G_mat upper triangle from lower triangle backup
+        @inbounds for i in 1:dimG
+            G_mat[i, i] = b_vec[i]
+            for j in (i + 1):dimG
+                G_mat[i, j] = G_mat[j, i]
             end
-            symmetric_pinv_solve!(G_mat, b_vec)
         end
     end
 
+    sol = symmetric_pinv_solve!(G_mat, b_vec)
     copyto!(CC, p1)
-    @inbounds for i in 1:dimG
-        axpy!(T(0.5) * coefficients[i], dirs[i], CC)
-    end
+    mul!(CC, D, sol, T(0.5), one(T))
     return CC
 end
 
@@ -365,7 +371,9 @@ function step!(
     points::Vector{Vector{T}},
     directions::Vector{Vector{T}},
     G::Matrix{T},
-    b_gram::Vector{T};
+    b_gram::Vector{T},
+    D_mat::Union{Nothing,Matrix{T}} = nothing,
+    coeffs::Union{Nothing,Vector{T}} = nothing;
     weights::Union{Nothing,AbstractVector} = nothing,
     p0::Real = zero(T),
     fallback_counter::Union{Nothing,Base.RefValue{Int}} = nothing
@@ -376,7 +384,7 @@ function step!(
         @inbounds for i in 1:num_blocks
             apply_reflection!(points[i + 1], projections[i], points[i])
         end
-        return find_circumcenter!(x_next, points; directions=directions, G=G, b=b_gram, threaded=false, fallback_counter=fallback_counter)
+        return find_circumcenter!(x_next, points; directions=directions, G=G, b=b_gram, D_mat=D_mat, coeffs=coeffs, threaded=false, fallback_counter=fallback_counter)
     elseif method == :pCRM
         copyto!(points[1], x)
         if threaded
@@ -388,7 +396,7 @@ function step!(
                 apply_reflection!(points[i + 1], projections[i], x)
             end
         end
-        return find_circumcenter!(x_next, points; directions=directions, G=G, b=b_gram, threaded=threaded, fallback_counter=fallback_counter)
+        return find_circumcenter!(x_next, points; directions=directions, G=G, b=b_gram, D_mat=D_mat, coeffs=coeffs, threaded=threaded, fallback_counter=fallback_counter)
     elseif method in (:SPM, :FSPM)
         if threaded
             Threads.@threads :static for i in 1:num_blocks
@@ -440,8 +448,10 @@ function step(
     directions = [Vector{T}(undef, n) for _ in 1:num_blocks]
     G = Matrix{T}(undef, num_blocks, num_blocks)
     b_gram = Vector{T}(undef, num_blocks)
+    D_mat = Matrix{T}(undef, n, num_blocks)
+    coeffs = Vector{T}(undef, num_blocks)
     x_next = similar(x)
-    return step!(x_next, method, x, projections, threaded, points, directions, G, b_gram; weights=weights, p0=p0)
+    return step!(x_next, method, x, projections, threaded, points, directions, G, b_gram, D_mat, coeffs; weights=weights, p0=p0)
 end
 
 """
@@ -479,6 +489,8 @@ function solve(
     directions = [Vector{T}(undef, n) for _ in 1:num_blocks]
     G = Matrix{T}(undef, num_blocks, num_blocks)
     b_gram = Vector{T}(undef, num_blocks)
+    D_mat = Matrix{T}(undef, n, num_blocks)
+    coeffs = Vector{T}(undef, num_blocks)
 
     @. diff = x - xSol
     relative_error = norm(diff) / norm_solution
@@ -487,7 +499,7 @@ function solve(
     fallback_counter = Ref(0)
 
     while isfinite(relative_error) && relative_error > EPSVAL && iterations < itmax
-        step!(x_next, method, x, projections, threaded, points, directions, G, b_gram;
+        step!(x_next, method, x, projections, threaded, points, directions, G, b_gram, D_mat, coeffs;
               weights=weights, p0=p0, fallback_counter=fallback_counter)
         copyto!(x, x_next)
         iterations += 1
