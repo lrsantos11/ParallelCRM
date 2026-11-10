@@ -7,3 +7,4 @@ Manifest.toml
 /data/sims/*
 /data/table1_smoke/*
 !/data/table1/.gitkeep
+.vscode/*
