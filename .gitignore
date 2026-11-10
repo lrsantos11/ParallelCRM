@@ -1,0 +1,9 @@
+# Julia / DrWatson gitignore
+*.jl.cov
+*.jl.*.cov
+*.jl.mem
+.DS_Store
+Manifest.toml
+/data/sims/*
+/data/table1_smoke/*
+!/data/table1/.gitkeep

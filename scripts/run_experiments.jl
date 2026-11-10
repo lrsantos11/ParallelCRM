@@ -1,0 +1,303 @@
+using DrWatson
+@quickactivate "ParallelCRM"
+
+using BenchmarkTools
+using CSV
+using DataFrames
+using Dates
+using LinearAlgebra
+using ParallelCRM
+using Random
+using SHA
+using Statistics
+using TOML
+
+include(joinpath(@__DIR__, "make_table1.jl"))
+using .Table1Reporting
+
+const PROJECT_ROOT = projectdir()
+
+function parse_options(args)
+    options = Dict{String,Any}(
+        "smoke" => false,
+        "seed" => 42,
+        "samples" => 5,
+        "seconds" => 300.0,
+        "blas-threads" => 1,
+        "accelerator" => "auto",
+        "stat" => "min",
+        "overwrite" => true,
+        "output-dir" => datadir("table1")
+    )
+    for arg in args
+        if arg == "--smoke"
+            options["smoke"] = true
+        elseif arg == "--no-overwrite"
+            options["overwrite"] = false
+        elseif arg == "--help"
+            println("""
+            Usage: julia --project=. --threads=N scripts/run_experiments.jl [options]
+
+            Options:
+              --smoke                 Run a quick smoke test on small matrices (m=120, n=20)
+              --seed=42               MersenneTwister random seed (default: 42)
+              --samples=5             Number of BenchmarkTools samples per method/instance (default: 5)
+              --repetitions=5         Alias for --samples
+              --seconds=300           Maximum BenchmarkTools budget in seconds per trial (default: 300)
+              --blas-threads=1        Number of BLAS threads (default: 1)
+              --accelerator=auto      BLAS backend: auto, accelerate, mkl, or openblas (default: auto)
+              --stat=min              Aggregation statistic: min (@belapsed) or median (default: min)
+              --output-dir=PATH       Directory for CSV and TOML outputs (default: data/table1)
+              --no-overwrite          Fail if raw_threadsN.csv already exists in output-dir
+            """)
+            return nothing
+        else
+            startswith(arg, "--") && occursin('=', arg) || error("Unknown option: $arg")
+            key, value = split(arg[3:end], '='; limit=2)
+            if key == "repetitions"
+                options["samples"] = parse(Int, value)
+            elseif key in ("seed", "samples", "blas-threads")
+                options[key] = parse(Int, value)
+            elseif key == "seconds"
+                options[key] = parse(Float64, value)
+            elseif key in ("output-dir", "accelerator", "stat")
+                options[key] = String(value)
+            elseif key == "overwrite"
+                options["overwrite"] = parse(Bool, value)
+            else
+                error("Unknown option: $arg")
+            end
+        end
+    end
+    options["samples"] > 0 || error("samples/repetitions must be positive")
+    options["blas-threads"] >= 1 || error("blas-threads must be >= 1")
+    return options
+end
+
+function file_fingerprint(paths)
+    io = IOBuffer()
+    for path in paths
+        isfile(path) || error("Missing reproducibility file: $path")
+        write(io, relpath(path, PROJECT_ROOT), '\0', read(path), '\0')
+    end
+    return bytes2hex(sha256(take!(io)))
+end
+
+function instance_fingerprint(A, b, solution, ranges)
+    io = IOBuffer()
+    write(io, Int64[size(A)...], A, b, solution)
+    for r in ranges
+        write(io, Int64[first(r), last(r)])
+    end
+    return bytes2hex(sha256(take!(io)))
+end
+
+function git_information()
+    paths = [
+        "src/ParallelCRM.jl",
+        "scripts/run_experiments.jl",
+        "scripts/make_table1.jl",
+        "test/runtests.jl",
+        "Project.toml"
+    ]
+    try
+        head = strip(read(pipeline(`git -C $PROJECT_ROOT rev-parse HEAD`; stderr=devnull), String))
+        changes = strip(read(pipeline(`git -C $PROJECT_ROOT status --porcelain -- $paths`; stderr=devnull), String))
+        tracked = all(paths) do path
+            success(pipeline(`git -C $PROJECT_ROOT ls-files --error-unmatch $path`; stdout=devnull, stderr=devnull))
+        end
+        return head, !isempty(changes) || !tracked
+    catch
+        return "not-a-git-checkout", true
+    end
+end
+
+function machine_information(active_accelerator::String)
+    cpu = Sys.cpu_info()
+    return Dict{String,Any}(
+        "cpu_models" => sort(unique(c.model for c in cpu)),
+        "logical_cpus_visible" => length(cpu),
+        "cpu_threads" => Sys.CPU_THREADS,
+        "memory_bytes" => Sys.total_memory(),
+        "machine" => Sys.MACHINE,
+        "arch" => string(Sys.ARCH),
+        "kernel" => string(Sys.KERNEL),
+        "accelerator" => active_accelerator,
+        "blas_configuration" => sprint(show, BLAS.get_config())
+    )
+end
+
+function run_experiments(args=ARGS)
+    options = parse_options(args)
+    isnothing(options) && return
+
+    active_accelerator = configure_accelerator!(
+        accelerator = Symbol(options["accelerator"]),
+        blas_threads = options["blas-threads"],
+        verbose = true
+    )
+
+    nt = Threads.nthreads()
+    outdir = abspath(options["output-dir"])
+    mkpath(outdir)
+    raw_path = joinpath(outdir, "raw_threads$(nt).csv")
+    metadata_path = joinpath(outdir, "metadata_threads$(nt).toml")
+    if !options["overwrite"] && any(isfile, [raw_path, metadata_path])
+        error("Outputs already exist in $outdir; choose a new --output-dir or omit --no-overwrite")
+    end
+
+    samples = options["samples"]
+    max_seconds = options["seconds"]
+    smoke = options["smoke"]
+    mode = smoke ? "smoke" : "full"
+    row_counts = smoke ? [120] : [5000, 7500, 10000, 12500]
+    col_counts = smoke ? [20] : [100, 250, 500]
+    coherences = [0.0, 0.1, 0.2]
+    tolerance = 1e-5
+    iteration_limit = 10_000
+
+    sources = [
+        srcdir("ParallelCRM.jl"),
+        scriptsdir("run_experiments.jl"),
+        scriptsdir("make_table1.jl"),
+        projectdir("test", "runtests.jl"),
+        projectdir("Project.toml")
+    ]
+    source_hash = file_fingerprint(sources)
+    machine = machine_information(active_accelerator)
+    env_buffer = IOBuffer()
+    TOML.print(env_buffer, machine; sorted=true)
+    environment_hash = bytes2hex(sha256(take!(env_buffer)))
+    commit, dirty = git_information()
+
+    metadata = Dict{String,Any}(
+        "started_utc" => string(now(UTC)),
+        "complete" => false,
+        "source_sha256" => source_hash,
+        "environment_sha256" => environment_hash,
+        "source_commit" => commit,
+        "source_dirty_or_untracked" => dirty,
+        "julia_version" => string(VERSION),
+        "julia_threads" => nt,
+        "blas_threads" => BLAS.get_num_threads(),
+        "accelerator" => active_accelerator,
+        "seed" => options["seed"],
+        "rng" => "MersenneTwister (private; regenerated identically in each process)",
+        "mode" => mode,
+        "rows" => row_counts,
+        "columns" => col_counts,
+        "coherences" => coherences,
+        "tolerance" => tolerance,
+        "iteration_limit" => iteration_limit,
+        "samples" => samples,
+        "benchmark_engine" => "BenchmarkTools (@benchmark with evals=1, gcsample=true)",
+        "timing_statistic" => "configurable: minimum (@belapsed) or median across samples, then arithmetic mean over three coherences",
+        "preprocessing_included" => false,
+        "preprocessing_excluded" => "matrix/RHS generation, partition, QR factorizations, reference/warm-up run, explicit pre-sample GC, validation and output",
+        "gc_policy" => "BenchmarkTools gcsample=true (GC.gc() before each timed sample)",
+        "method_order" => "cyclic rotation by instance; runs are sequential",
+        "machine" => machine
+    )
+
+    function save_metadata()
+        open(metadata_path, "w") do io
+            TOML.print(io, metadata; sorted=true)
+        end
+    end
+    save_metadata()
+
+    rng = MersenneTwister(options["seed"])
+    raw = DataFrame()
+
+    # The serial run (threads=1) executes CRM, P-CRM, and F-SPM.
+    # Multithreaded runs (threads>1) execute P-CRM and F-SPM in parallel across blocks.
+    methods = nt == 1 ? [:pCRM, :CRM, :SPM] : [:pCRM, :SPM]
+    labels = Dict(:pCRM => "P-CRM", :CRM => "CRM", :SPM => "F-SPM (uniform weights)")
+    instance_number = 0
+
+    for m in row_counts, n in col_counts, c in coherences
+        instance_number += 1
+        preprocessing_start = time_ns()
+        A = (1 - c) .* randn(rng, m, n) .+ c
+        w = randn(rng, m)
+        xSol = normalize!(A' * w)
+        b = A * xSol
+        x0 = zeros(n)
+        blocks = fld(m, n) + 1
+        ranges = balanced_row_ranges(m, blocks)
+        projections = projection_block_QR(A, b, blocks)
+        preprocessing_seconds = (time_ns() - preprocessing_start) / 1e9
+        instance_hash = instance_fingerprint(A, b, xSol, ranges)
+
+        for method in circshift(methods, -(instance_number - 1))
+            threaded = nt > 1 && method != :CRM
+
+            # Reference solve outside timing: warms up JIT and records exact deterministic counters & accuracy
+            reference = solve(method, x0, projections;
+                xSol=xSol, itmax=iteration_limit, EPSVAL=tolerance, threaded=threaded)
+            measured_error = norm(reference.x - xSol) / norm(xSol)
+            isequal(measured_error, reference.relative_error) || error("Incorrect reported error")
+
+            # BenchmarkTools timing with evals=1 and pre-sample GC
+            trial = @benchmark solve($method, $x0, $projections;
+                xSol=$xSol, itmax=$iteration_limit, EPSVAL=$tolerance, threaded=$threaded) samples=samples evals=1 seconds=max_seconds gcsample=true
+
+            n_recorded = length(trial.times)
+            for repetition in 1:n_recorded
+                push!(raw, (
+                    method = labels[method],
+                    threads = nt,
+                    blocks = blocks,
+                    rows = m,
+                    columns = n,
+                    coherence = c,
+                    iterations = reference.iterations,
+                    projections = reference.projections,
+                    relative_error = measured_error,
+                    converged = reference.converged,
+                    status = reference.status,
+                    repetition = repetition,
+                    repetitions = n_recorded,
+                    time_seconds = trial.times[repetition] / 1e9,
+                    gc_seconds = trial.gctimes[repetition] / 1e9,
+                    allocated_bytes = trial.memory,
+                    preprocessing_seconds = preprocessing_seconds,
+                    seed = options["seed"],
+                    tolerance = tolerance,
+                    iteration_limit = iteration_limit,
+                    blas_threads = BLAS.get_num_threads(),
+                    accelerator = active_accelerator,
+                    julia_version = string(VERSION),
+                    mode = mode,
+                    source_sha256 = source_hash,
+                    instance_sha256 = instance_hash,
+                    environment_sha256 = environment_hash,
+                    source_commit = commit,
+                    source_dirty_or_untracked = dirty,
+                    threaded = threaded
+                ); cols=:union)
+            end
+
+            CSV.write(raw_path, raw)
+            min_ms = (minimum(trial.times) / 1e6)
+            med_ms = (median(trial.times) / 1e6)
+            println("[$mode] $(labels[method]) (threads=$nt), size=($m,$n), blocks=$blocks, c=$c: ",
+                    "iter=$(reference.iterations), proj=$(reference.projections), ",
+                    "min=$(round(min_ms, digits=3)) ms, median=$(round(med_ms, digits=3)) ms, ",
+                    "err=$(round(reference.relative_error, sigdigits=3))")
+            flush(stdout)
+        end
+    end
+
+    stat_sym = Symbol(options["stat"])
+    aggregate_table1([raw_path], joinpath(outdir, "table1_threads$(nt)"); require_full=false, stat=stat_sym, show_table=true)
+    metadata["complete"] = true
+    metadata["finished_utc"] = string(now(UTC))
+    metadata["timed_solves"] = nrow(raw)
+    save_metadata()
+    println("Saved $raw_path and $metadata_path")
+end
+
+if abspath(PROGRAM_FILE) == (@__FILE__)
+    run_experiments()
+end
